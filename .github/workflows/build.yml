@@ -1,0 +1,35 @@
+name: Build Windows x64
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22.x"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: go build -trimpath -ldflags="-s -w" -o dist/DHCP_MAC_Monitor.exe ./cmd/dhcp-mac-monitor
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DHCP_MAC_Monitor_Windows_x64
+          path: dist/DHCP_MAC_Monitor.exe
