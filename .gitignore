@@ -1,0 +1,16 @@
+dhcp_monitor_data.json
+dhcp_monitor_data.json.*
+startup.log
+backup/
+config.json
+!configs/config.example.json
+
+bin/
+dist/
+*.exe
+!release/DHCP_MAC_Monitor_v1.7.1_Windows_x64.exe
+
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
