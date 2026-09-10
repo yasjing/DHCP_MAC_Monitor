@@ -1,14 +1,22 @@
 dhcp_monitor_data.json
 dhcp_monitor_data.json.*
+dhcp_monitor.db
+dhcp_monitor.db-*
+dhcp_monitor_emergency.json
 startup.log
+*.log
 backup/
+export/
+import/*.csv
 config.json
 !configs/config.example.json
 
 bin/
 dist/
+build/
+package/
 *.exe
-!release/DHCP_MAC_Monitor_v1.7.1_Windows_x64.exe
+!release/*.exe
 
 .idea/
 .vscode/
