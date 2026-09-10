@@ -1,0 +1,65 @@
+sqliteDB == nil {
+		return fmt.Errorf("sqlite is not initialized")
+	}
+	return sqliteDB.withTransaction(func() error {
+		stmt, err := sqliteDB.prepareUnlocked(`INSERT INTO audit_logs(time,username,action,mac,detail,client_ip) VALUES(?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer stmt.finalize()
+		for _, a := range rows {
+			if err := stmt.bindAll([]interface{}{a.Time, a.Username, a.Action, a.MAC, a.Detail, a.ClientIP}); err != nil {
+				return err
+			}
+			rc, err := stmt.step()
+			if err != nil {
+				return err
+			}
+			if rc != sqliteDone {
+				return fmt.Errorf("audit batch insert did not finish")
+			}
+			if err := stmt.reset(); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func queryAuditSQLite(page, pageSize int, q string) ([]Audit, int, error) {
+	if sqliteDB == nil {
+		return nil, 0, fmt.Errorf("sqlite is not initialized")
+	}
+	where := ""
+	args := []interface{}{}
+	if strings.TrimSpace(q) != "" {
+		pattern := "%" + strings.ToLower(strings.TrimSpace(q)) + "%"
+		where = ` WHERE lower(username) LIKE ? OR lower(action) LIKE ? OR lower(mac) LIKE ? OR lower(detail) LIKE ? OR lower(client_ip) LIKE ?`
+		for i := 0; i < 5; i++ {
+			args = append(args, pattern)
+		}
+	}
+	total, err := sqliteDB.queryOneInt(`SELECT COUNT(*) FROM audit_logs`+where, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	offset := (page - 1) * pageSize
+	qargs := append([]interface{}{}, args...)
+	qargs = append(qargs, pageSize, offset)
+	out := make([]Audit, 0, pageSize)
+	err = sqliteDB.queryRows(`SELECT time,username,action,mac,detail,client_ip FROM audit_logs`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`, qargs, func(s *winStmt) error {
+		out = append(out, Audit{
+			Time: s.columnText(0), Username: s.columnText(1), Action: s.columnText(2),
+			MAC: s.columnText(3), Detail: s.columnText(4), ClientIP: s.columnText(5),
+		})
+		return nil
+	})
+	return out, total, err
+}
+
+func logStorageError(context string, err error) {
+	if err != nil {
+		log.Printf("[storage] %s: %v", context, err)
+	}
+}
