@@ -1,0 +1,307 @@
+rorf("device insert did not finish")
+			}
+			if err := dstmt.reset(); err != nil {
+				dstmt.finalize()
+				return err
+			}
+		}
+		dstmt.finalize()
+
+		ustmt, err := sqliteDB.prepareUnlocked(`INSERT INTO users(username,data_json,updated_at) VALUES(?,?,?)`)
+		if err != nil {
+			return err
+		}
+		for username, u := range state.Users {
+			b, err := json.Marshal(u)
+			if err != nil {
+				ustmt.finalize()
+				return err
+			}
+			if err := ustmt.bindAll([]interface{}{username, string(b), u.CreatedAt}); err != nil {
+				ustmt.finalize()
+				return err
+			}
+			rc, err := ustmt.step()
+			if err != nil || rc != sqliteDone {
+				ustmt.finalize()
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("user insert did not finish")
+			}
+			if err := ustmt.reset(); err != nil {
+				ustmt.finalize()
+				return err
+			}
+		}
+		ustmt.finalize()
+
+		astmt, err := sqliteDB.prepareUnlocked(`INSERT INTO audit_logs(time,username,action,mac,detail,client_ip) VALUES(?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		for _, a := range state.Audit {
+			if err := astmt.bindAll([]interface{}{a.Time, a.Username, a.Action, a.MAC, a.Detail, a.ClientIP}); err != nil {
+				astmt.finalize()
+				return err
+			}
+			rc, err := astmt.step()
+			if err != nil || rc != sqliteDone {
+				astmt.finalize()
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("audit insert did not finish")
+			}
+			if err := astmt.reset(); err != nil {
+				astmt.finalize()
+				return err
+			}
+		}
+		astmt.finalize()
+
+		rstmt, err := sqliteDB.prepareUnlocked(`INSERT INTO recycle_bin(deleted_at,mac,data_json) VALUES(?,?,?)`)
+		if err != nil {
+			return err
+		}
+		for _, x := range state.RecycleBin {
+			b, err := json.Marshal(x)
+			if err != nil {
+				rstmt.finalize()
+				return err
+			}
+			if err := rstmt.bindAll([]interface{}{x.DeletedAt, x.Snapshot.MAC, string(b)}); err != nil {
+				rstmt.finalize()
+				return err
+			}
+			rc, err := rstmt.step()
+			if err != nil || rc != sqliteDone {
+				rstmt.finalize()
+				if err != nil {
+					return err
+				}
+				return fmt.Errorf("recycle insert did not finish")
+			}
+			if err := rstmt.reset(); err != nil {
+				rstmt.finalize()
+				return err
+			}
+		}
+		rstmt.finalize()
+
+		// Verify row counts before marking the migration complete. This is the
+		// guard that prevents a partial migration from becoming primary storage.
+		countUnlocked := func(table string) (int, error) {
+			stmt, err := sqliteDB.prepareUnlocked(`SELECT COUNT(*) FROM ` + table)
+			if err != nil {
+				return 0, err
+			}
+			defer stmt.finalize()
+			rc, err := stmt.step()
+			if err != nil {
+				return 0, err
+			}
+			if rc != sqliteRow {
+				return 0, fmt.Errorf("count %s returned no row", table)
+			}
+			return int(stmt.columnInt64(0)), nil
+		}
+		dc, err := countUnlocked("devices")
+		if err != nil {
+			return err
+		}
+		uc, err := countUnlocked("users")
+		if err != nil {
+			return err
+		}
+		ac, err := countUnlocked("audit_logs")
+		if err != nil {
+			return err
+		}
+		rcCount, err := countUnlocked("recycle_bin")
+		if err != nil {
+			return err
+		}
+		if dc != expectedDevices || uc != expectedUsers || ac != expectedAudit || rcCount != expectedRecycle {
+			return fmt.Errorf("migration verification failed: devices %d/%d users %d/%d audit %d/%d recycle %d/%d", dc, expectedDevices, uc, expectedUsers, ac, expectedAudit, rcCount, expectedRecycle)
+		}
+
+		meta := [][2]string{
+			{"schema_version", fmt.Sprint(sqliteSchemaVersion)},
+			{"migration_complete", "1"},
+			{"migrated_at", nowISO()},
+			{"source", "dhcp_monitor_data.json"},
+			{"migration_backup", backupDir},
+		}
+		for _, kv := range meta {
+			if err := sqliteDB.execPreparedUnlocked(`INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)`, kv[0], kv[1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	setSQLitePrimary(true)
+	// History remains in audit_logs; freeing this slice avoids carrying a large
+	// JSON audit history in RAM after migration.
+	state.Audit = []Audit{}
+	return nil
+}
+
+func saveCoreStateSQLiteLocked() error {
+	if sqliteDB == nil {
+		return fmt.Errorf("sqlite is not initialized")
+	}
+	pendingAudit := append([]Audit(nil), state.Audit...)
+	err := sqliteDB.withTransaction(func() error {
+		if err := sqliteDB.execUnlocked(`DELETE FROM devices`); err != nil {
+			return err
+		}
+		dstmt, err := sqliteDB.prepareUnlocked(`INSERT INTO devices(mac,data_json,updated_at) VALUES(?,?,?)`)
+		if err != nil {
+			return err
+		}
+		for mac, d := range state.Devices {
+			b, err := json.Marshal(d)
+			if err != nil {
+				dstmt.finalize()
+				return err
+			}
+			if err := dstmt.bindAll([]interface{}{mac, string(b), d.UpdatedAt}); err != nil {
+				dstmt.finalize()
+				return err
+			}
+			rc, err := dstmt.step()
+			if err != nil {
+				dstmt.finalize()
+				return err
+			}
+			if rc != sqliteDone {
+				dstmt.finalize()
+				return fmt.Errorf("device save did not finish")
+			}
+			if err := dstmt.reset(); err != nil {
+				dstmt.finalize()
+				return err
+			}
+		}
+		dstmt.finalize()
+
+		if err := sqliteDB.execUnlocked(`DELETE FROM users`); err != nil {
+			return err
+		}
+		ustmt, err := sqliteDB.prepareUnlocked(`INSERT INTO users(username,data_json,updated_at) VALUES(?,?,?)`)
+		if err != nil {
+			return err
+		}
+		for username, u := range state.Users {
+			b, err := json.Marshal(u)
+			if err != nil {
+				ustmt.finalize()
+				return err
+			}
+			if err := ustmt.bindAll([]interface{}{username, string(b), u.CreatedAt}); err != nil {
+				ustmt.finalize()
+				return err
+			}
+			rc, err := ustmt.step()
+			if err != nil {
+				ustmt.finalize()
+				return err
+			}
+			if rc != sqliteDone {
+				ustmt.finalize()
+				return fmt.Errorf("user save did not finish")
+			}
+			if err := ustmt.reset(); err != nil {
+				ustmt.finalize()
+				return err
+			}
+		}
+		ustmt.finalize()
+
+		if err := sqliteDB.execUnlocked(`DELETE FROM recycle_bin`); err != nil {
+			return err
+		}
+		rstmt, err := sqliteDB.prepareUnlocked(`INSERT INTO recycle_bin(deleted_at,mac,data_json) VALUES(?,?,?)`)
+		if err != nil {
+			return err
+		}
+		for _, x := range state.RecycleBin {
+			b, err := json.Marshal(x)
+			if err != nil {
+				rstmt.finalize()
+				return err
+			}
+			if err := rstmt.bindAll([]interface{}{x.DeletedAt, x.Snapshot.MAC, string(b)}); err != nil {
+				rstmt.finalize()
+				return err
+			}
+			rc, err := rstmt.step()
+			if err != nil {
+				rstmt.finalize()
+				return err
+			}
+			if rc != sqliteDone {
+				rstmt.finalize()
+				return fmt.Errorf("recycle save did not finish")
+			}
+			if err := rstmt.reset(); err != nil {
+				rstmt.finalize()
+				return err
+			}
+		}
+		rstmt.finalize()
+
+		// Legacy batch paths may append audit rows while holding the state lock.
+		// Flush them in the same transaction so every delete/disable/release event
+		// remains recoverable after switching to SQLite.
+		if len(pendingAudit) > 0 {
+			astmt, err := sqliteDB.prepareUnlocked(`INSERT INTO audit_logs(time,username,action,mac,detail,client_ip) VALUES(?,?,?,?,?,?)`)
+			if err != nil {
+				return err
+			}
+			for _, a := range pendingAudit {
+				if err := astmt.bindAll([]interface{}{a.Time, a.Username, a.Action, a.MAC, a.Detail, a.ClientIP}); err != nil {
+					astmt.finalize()
+					return err
+				}
+				rc, err := astmt.step()
+				if err != nil {
+					astmt.finalize()
+					return err
+				}
+				if rc != sqliteDone {
+					astmt.finalize()
+					return fmt.Errorf("pending audit save did not finish")
+				}
+				if err := astmt.reset(); err != nil {
+					astmt.finalize()
+					return err
+				}
+			}
+			astmt.finalize()
+		}
+		return nil
+	})
+	if err == nil && len(pendingAudit) > 0 {
+		state.Audit = state.Audit[len(pendingAudit):]
+	}
+	return err
+}
+
+func insertAuditSQLite(a Audit) error {
+	if sqliteDB == nil {
+		return fmt.Errorf("sqlite is not initialized")
+	}
+	return sqliteDB.execPrepared(`INSERT INTO audit_logs(time,username,action,mac,detail,client_ip) VALUES(?,?,?,?,?,?)`, a.Time, a.Username, a.Action, a.MAC, a.Detail, a.ClientIP)
+}
+
+func insertAuditRowsSQLite(rows []Audit) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	if 

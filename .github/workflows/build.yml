@@ -3,12 +3,10 @@ name: Build Windows x64
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -16,20 +14,100 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22.x"
+          go-version: "1.23.x"
+
+      - name: Assemble V1.8.0 source
+        shell: pwsh
+        run: |
+          $utf8 = New-Object System.Text.UTF8Encoding($false)
+          $patchParts = Get-ChildItem ".github/v180-bootstrap/main.patch.part*" | Sort-Object Name
+          $patch = ($patchParts | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join ""
+          [System.IO.File]::WriteAllText((Join-Path $PWD "v180-main.patch"), $patch, $utf8)
+          git apply --check v180-main.patch
+          git apply v180-main.patch
+
+          $storageParts = Get-ChildItem ".github/v180-bootstrap/storage.go.part*" | Sort-Object Name
+          $storage = ($storageParts | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join ""
+          [System.IO.File]::WriteAllText((Join-Path $PWD "cmd/dhcp-mac-monitor/storage_sqlite_windows.go"), $storage, $utf8)
+          Remove-Item v180-main.patch -Force
+          gofmt -w cmd/dhcp-mac-monitor/main.go cmd/dhcp-mac-monitor/storage_sqlite_windows.go
 
       - name: Test
+        shell: pwsh
         run: go test ./...
 
       - name: Build
-        run: go build -trimpath -ldflags="-s -w" -o dist/DHCP_MAC_Monitor.exe ./cmd/dhcp-mac-monitor
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          go build -trimpath -ldflags="-s -w" -o build/DHCP_MAC_Monitor.exe ./cmd/dhcp-mac-monitor
 
-      - name: Upload artifact
+      - name: Package V1.8.0
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item build/DHCP_MAC_Monitor.exe release/DHCP_MAC_Monitor_v1.8.0_Windows_x64.exe -Force
+          Copy-Item VERSION.txt release/VERSION.txt -Force
+          Copy-Item V1.8.0_升级说明.md release/V1.8.0_升级说明.txt -Force
+
+          Remove-Item release/DHCP_MAC_Monitor_v1.8.0_UPDATE_ONLY.zip -Force -ErrorAction SilentlyContinue
+          Remove-Item release/DHCP_MAC_Monitor_v1.8.0_Windows_x64.zip -Force -ErrorAction SilentlyContinue
+          Remove-Item package -Recurse -Force -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force package/update | Out-Null
+          Copy-Item build/DHCP_MAC_Monitor.exe package/update/DHCP_MAC_Monitor.exe
+          Copy-Item VERSION.txt package/update/VERSION.txt
+          Copy-Item V1.8.0_升级说明.md package/update/V1.8.0_升级说明.txt
+          Compress-Archive -Path package/update/* -DestinationPath release/DHCP_MAC_Monitor_v1.8.0_UPDATE_ONLY.zip -Force
+
+          New-Item -ItemType Directory -Force package/full/DHCP_MAC_Monitor | Out-Null
+          Copy-Item build/DHCP_MAC_Monitor.exe package/full/DHCP_MAC_Monitor/DHCP_MAC_Monitor.exe
+          Copy-Item configs/config.example.json package/full/DHCP_MAC_Monitor/config.json
+          Copy-Item scripts/OPEN_FIREWALL_8888.bat package/full/DHCP_MAC_Monitor/OPEN_FIREWALL_8888.bat
+          Copy-Item IMPORT_TEMPLATE.csv package/full/DHCP_MAC_Monitor/IMPORT_TEMPLATE.csv
+          Copy-Item VERSION.txt package/full/DHCP_MAC_Monitor/VERSION.txt
+          Copy-Item V1.8.0_升级说明.md package/full/DHCP_MAC_Monitor/V1.8.0_升级说明.txt
+          Copy-Item README.md package/full/DHCP_MAC_Monitor/README.md
+          Compress-Archive -Path package/full/DHCP_MAC_Monitor -DestinationPath release/DHCP_MAC_Monitor_v1.8.0_Windows_x64.zip -Force
+
+          $targets = @(
+            'DHCP_MAC_Monitor_v1.8.0_Windows_x64.exe',
+            'DHCP_MAC_Monitor_v1.8.0_UPDATE_ONLY.zip',
+            'DHCP_MAC_Monitor_v1.8.0_Windows_x64.zip'
+          )
+          $lines = foreach ($name in $targets) {
+            $hash = (Get-FileHash (Join-Path 'release' $name) -Algorithm SHA256).Hash.ToLower()
+            "$hash  $name"
+          }
+          [System.IO.File]::WriteAllLines((Join-Path $PWD 'release/SHA256.txt'), $lines, (New-Object System.Text.UTF8Encoding($false)))
+
+      - name: Commit finalized source and release packages
+        shell: pwsh
+        run: |
+          Remove-Item .github/v180-bootstrap -Recurse -Force
+          Remove-Item package -Recurse -Force -ErrorAction SilentlyContinue
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Finalize DHCP MAC Monitor V1.8.0 SQLite release [skip ci]"
+            git push origin HEAD:main
+          }
+
+      - name: Upload V1.8.0 packages
         uses: actions/upload-artifact@v4
         with:
-          name: DHCP_MAC_Monitor_Windows_x64
-          path: dist/DHCP_MAC_Monitor.exe
+          name: DHCP_MAC_Monitor_v1.8.0_Windows_x64
+          path: |
+            release/DHCP_MAC_Monitor_v1.8.0_UPDATE_ONLY.zip
+            release/DHCP_MAC_Monitor_v1.8.0_Windows_x64.zip
+            release/DHCP_MAC_Monitor_v1.8.0_Windows_x64.exe
+            release/SHA256.txt

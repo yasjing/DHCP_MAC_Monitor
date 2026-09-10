@@ -1,0 +1,6 @@
+DHCP MAC Monitor
+Version: 1.8.0
+Platform: Windows x64
+Build: standalone executable
+Storage: SQLite primary + JSON safe fallback
+Release date: 2026-09-10

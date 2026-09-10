@@ -1,0 +1,299 @@
+
+func (db *winSQLite) execPrepared(sqlText string, args ...interface{}) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.execPreparedUnlocked(sqlText, args...)
+}
+
+func (db *winSQLite) withTransaction(fn func() error) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if err := db.execUnlocked("BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = db.execUnlocked("ROLLBACK")
+		}
+	}()
+	if err := fn(); err != nil {
+		return err
+	}
+	if err := db.execUnlocked("COMMIT"); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+func (db *winSQLite) queryRows(sqlText string, args []interface{}, rowFn func(*winStmt) error) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	stmt, err := db.prepareUnlocked(sqlText)
+	if err != nil {
+		return err
+	}
+	defer stmt.finalize()
+	if err := stmt.bindAll(args); err != nil {
+		return err
+	}
+	for {
+		rc, err := stmt.step()
+		if err != nil {
+			return err
+		}
+		if rc == sqliteDone {
+			return nil
+		}
+		if err := rowFn(stmt); err != nil {
+			return err
+		}
+	}
+}
+
+func (db *winSQLite) queryOneInt(sqlText string, args ...interface{}) (int, error) {
+	n := 0
+	found := false
+	err := db.queryRows(sqlText, args, func(s *winStmt) error {
+		if !found {
+			n = int(s.columnInt64(0))
+			found = true
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if !found {
+		return 0, fmt.Errorf("SQLite query returned no row")
+	}
+	return n, nil
+}
+
+func (db *winSQLite) queryOneText(sqlText string, args ...interface{}) (string, bool, error) {
+	var out string
+	found := false
+	err := db.queryRows(sqlText, args, func(s *winStmt) error {
+		if !found {
+			out = s.columnText(0)
+			found = true
+		}
+		return nil
+	})
+	return out, found, err
+}
+
+func initSQLiteStorage(path string) error {
+	sqliteDBPath = path
+	db, err := openWinSQLite(path)
+	if err != nil {
+		return err
+	}
+
+	pragmas := []string{
+		`PRAGMA journal_mode=WAL`,
+		`PRAGMA synchronous=NORMAL`,
+		`PRAGMA foreign_keys=ON`,
+		`PRAGMA temp_store=MEMORY`,
+	}
+	for _, p := range pragmas {
+		if err := db.exec(p); err != nil {
+			db.close()
+			return fmt.Errorf("sqlite pragma failed: %w", err)
+		}
+	}
+
+	schema := []string{
+		`CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`,
+		`CREATE TABLE IF NOT EXISTS devices (mac TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, data_json TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE IF NOT EXISTS audit_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, time TEXT NOT NULL, username TEXT NOT NULL, action TEXT NOT NULL, mac TEXT NOT NULL DEFAULT '', detail TEXT NOT NULL DEFAULT '', client_ip TEXT NOT NULL DEFAULT '')`,
+		`CREATE TABLE IF NOT EXISTS recycle_bin (id INTEGER PRIMARY KEY AUTOINCREMENT, deleted_at TEXT NOT NULL, mac TEXT NOT NULL DEFAULT '', data_json TEXT NOT NULL)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_logs_time ON audit_logs(time)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_logs_username ON audit_logs(username)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_logs_mac ON audit_logs(mac)`,
+		`CREATE INDEX IF NOT EXISTS idx_recycle_bin_mac ON recycle_bin(mac)`,
+	}
+	for _, stmt := range schema {
+		if err := db.exec(stmt); err != nil {
+			db.close()
+			return fmt.Errorf("sqlite schema failed: %w", err)
+		}
+	}
+	sqliteDB = db
+	return nil
+}
+
+func closeSQLiteStorage() {
+	sqliteMu.Lock()
+	db := sqliteDB
+	sqliteDB = nil
+	sqlitePrimary = false
+	sqliteMu.Unlock()
+	if db != nil {
+		db.close()
+	}
+}
+
+func sqliteMigrationComplete() bool {
+	if sqliteDB == nil {
+		return false
+	}
+	v, found, err := sqliteDB.queryOneText(`SELECT value FROM meta WHERE key='migration_complete'`)
+	return err == nil && found && v == "1"
+}
+
+func normalizeStateAfterLoad() {
+	if state.Devices == nil {
+		state.Devices = map[string]*Device{}
+	}
+	if state.Users == nil {
+		state.Users = map[string]*User{}
+	}
+	if state.Audit == nil {
+		state.Audit = []Audit{}
+	}
+	if state.RecycleBin == nil {
+		state.RecycleBin = []DeletedDevice{}
+	}
+	for mac, d := range state.Devices {
+		if d == nil {
+			delete(state.Devices, mac)
+			continue
+		}
+		if d.ActiveLeases == nil {
+			d.ActiveLeases = []LeaseSnapshot{}
+		}
+		if d.OnlineDates == nil {
+			d.OnlineDates = []string{}
+		}
+		if d.MultiLease.Observations == nil {
+			d.MultiLease.Observations = []LeaseObservation{}
+		}
+		if d.MultiLease.StaleIPs == nil {
+			d.MultiLease.StaleIPs = []string{}
+		}
+	}
+	for _, u := range state.Users {
+		u.Role = strings.ToLower(strings.TrimSpace(u.Role))
+		if u.Role != "admin" && u.Role != "operator" && u.Role != "viewer" {
+			u.Role = "viewer"
+		}
+	}
+}
+
+func loadStateFromSQLite() error {
+	if sqliteDB == nil {
+		return fmt.Errorf("sqlite is not initialized")
+	}
+	loaded := Persist{Devices: map[string]*Device{}, Users: map[string]*User{}, Audit: []Audit{}, RecycleBin: []DeletedDevice{}}
+
+	if err := sqliteDB.queryRows(`SELECT mac, data_json FROM devices ORDER BY mac`, nil, func(s *winStmt) error {
+		mac := s.columnText(0)
+		raw := s.columnText(1)
+		var d Device
+		if err := json.Unmarshal([]byte(raw), &d); err != nil {
+			return fmt.Errorf("decode device %s: %w", mac, err)
+		}
+		if d.MAC == "" {
+			d.MAC = mac
+		}
+		loaded.Devices[mac] = &d
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := sqliteDB.queryRows(`SELECT username, data_json FROM users ORDER BY username`, nil, func(s *winStmt) error {
+		username := s.columnText(0)
+		raw := s.columnText(1)
+		var u User
+		if err := json.Unmarshal([]byte(raw), &u); err != nil {
+			return fmt.Errorf("decode user %s: %w", username, err)
+		}
+		if u.Username == "" {
+			u.Username = username
+		}
+		loaded.Users[username] = &u
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if err := sqliteDB.queryRows(`SELECT data_json FROM recycle_bin ORDER BY id`, nil, func(s *winStmt) error {
+		raw := s.columnText(0)
+		var x DeletedDevice
+		if err := json.Unmarshal([]byte(raw), &x); err != nil {
+			return fmt.Errorf("decode recycle entry: %w", err)
+		}
+		loaded.RecycleBin = append(loaded.RecycleBin, x)
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Audit logs are queried from SQLite with LIMIT/OFFSET and are intentionally
+	// not loaded into RAM at startup.
+	state = loaded
+	normalizeStateAfterLoad()
+	return nil
+}
+
+func createMigrationBackup() string {
+	root := filepath.Join(baseDir, "backup")
+	dir := filepath.Join(root, "before_sqlite_"+time.Now().Format("20060102_150405"))
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return ""
+	}
+	copyFileIfExists(dataPath, filepath.Join(dir, filepath.Base(dataPath)))
+	copyFileIfExists(filepath.Join(baseDir, "config.json"), filepath.Join(dir, "config.json"))
+	return dir
+}
+
+func migrateCurrentStateToSQLite() error {
+	if sqliteDB == nil {
+		return fmt.Errorf("sqlite is not initialized")
+	}
+	backupDir := createMigrationBackup()
+	expectedDevices := len(state.Devices)
+	expectedUsers := len(state.Users)
+	expectedAudit := len(state.Audit)
+	expectedRecycle := len(state.RecycleBin)
+
+	err := sqliteDB.withTransaction(func() error {
+		if err := sqliteDB.execUnlocked(`DELETE FROM devices`); err != nil {
+			return err
+		}
+		if err := sqliteDB.execUnlocked(`DELETE FROM users`); err != nil {
+			return err
+		}
+		if err := sqliteDB.execUnlocked(`DELETE FROM audit_logs`); err != nil {
+			return err
+		}
+		if err := sqliteDB.execUnlocked(`DELETE FROM recycle_bin`); err != nil {
+			return err
+		}
+
+		dstmt, err := sqliteDB.prepareUnlocked(`INSERT INTO devices(mac,data_json,updated_at) VALUES(?,?,?)`)
+		if err != nil {
+			return err
+		}
+		for mac, d := range state.Devices {
+			b, err := json.Marshal(d)
+			if err != nil {
+				dstmt.finalize()
+				return err
+			}
+			if err := dstmt.bindAll([]interface{}{mac, string(b), d.UpdatedAt}); err != nil {
+				dstmt.finalize()
+				return err
+			}
+			rc, err := dstmt.step()
+			if err != nil || rc != sqliteDone {
+				dstmt.finalize()
+				if err != nil {
+					return err
+				}
+				return fmt.Er

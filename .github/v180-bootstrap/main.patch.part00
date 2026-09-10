@@ -1,0 +1,257 @@
+--- a/cmd/dhcp-mac-monitor/main.go
++++ b/cmd/dhcp-mac-monitor/main.go
+@@ -19,6 +19,7 @@
+ 	"path/filepath"
+ 	"regexp"
+ 	"sort"
++	"strconv"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -158,6 +159,7 @@
+ 	cfg          Config
+ 	baseDir      string
+ 	dataPath     string
++	dbPath       string
+ 	state        Persist
+ 	mu           sync.RWMutex
+ 	sessions     = map[string]Session{}
+@@ -246,7 +248,17 @@
+ }
+ 
+ func backupDataOnStartup() {
+-	if _, err := os.Stat(dataPath); err != nil {
++	jsonExists := false
++	dbExists := false
++	if _, err := os.Stat(dataPath); err == nil {
++		jsonExists = true
++	}
++	if dbPath != "" {
++		if _, err := os.Stat(dbPath); err == nil {
++			dbExists = true
++		}
++	}
++	if !jsonExists && !dbExists {
+ 		return
+ 	}
+ 	root := filepath.Join(baseDir, "backup")
+@@ -254,13 +266,28 @@
+ 	if err := os.MkdirAll(dir, 0700); err != nil {
+ 		return
+ 	}
+-	copyFileIfExists(dataPath, filepath.Join(dir, filepath.Base(dataPath)))
++	if jsonExists {
++		copyFileIfExists(dataPath, filepath.Join(dir, filepath.Base(dataPath)))
++	}
++	if dbExists {
++		copyFileIfExists(dbPath, filepath.Join(dir, filepath.Base(dbPath)))
++		copyFileIfExists(dbPath+"-wal", filepath.Join(dir, filepath.Base(dbPath)+"-wal"))
++		copyFileIfExists(dbPath+"-shm", filepath.Join(dir, filepath.Base(dbPath)+"-shm"))
++	}
+ 	copyFileIfExists(filepath.Join(baseDir, "config.json"), filepath.Join(dir, "config.json"))
++
+ 	entries, err := os.ReadDir(root)
+-	if err == nil && len(entries) > 30 {
+-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+-		for _, e := range entries[:len(entries)-30] {
+-			if e.IsDir() {
++	if err == nil {
++		regular := make([]os.DirEntry, 0, len(entries))
++		stampDir := regexp.MustCompile(`^\d{8}_\d{6}$`)
++		for _, e := range entries {
++			if e.IsDir() && stampDir.MatchString(e.Name()) {
++				regular = append(regular, e)
++			}
++		}
++		if len(regular) > 30 {
++			sort.Slice(regular, func(i, j int) bool { return regular[i].Name() < regular[j].Name() })
++			for _, e := range regular[:len(regular)-30] {
+ 				_ = os.RemoveAll(filepath.Join(root, e.Name()))
+ 			}
+ 		}
+@@ -283,7 +310,7 @@
+ 	})
+ }
+ 
+-func saveStateLocked() error {
++func saveStateJSONLocked() error {
+ 	tmp := dataPath + ".tmp"
+ 	b, err := json.MarshalIndent(state, "", "  ")
+ 	if err != nil {
+@@ -295,62 +322,88 @@
+ 	return os.Rename(tmp, dataPath)
+ }
+ 
++func saveEmergencyJSONLocked() {
++	b, err := json.MarshalIndent(state, "", "  ")
++	if err != nil {
++		return
++	}
++	_ = os.WriteFile(filepath.Join(baseDir, "dhcp_monitor_emergency.json"), b, 0600)
++}
++
++func saveStateLocked() error {
++	if sqliteIsPrimary() {
++		if err := saveCoreStateSQLiteLocked(); err != nil {
++			saveEmergencyJSONLocked()
++			startupLog("SQLite save failed; emergency JSON written: %v", err)
++			return err
++		}
++		return nil
++	}
++	return saveStateJSONLocked()
++}
++
+ func loadState() error {
+-	state = Persist{Devices: map[string]*Device{}, Users: map[string]*User{}, Audit: []Audit{}}
++	state = Persist{Devices: map[string]*Device{}, Users: map[string]*User{}, Audit: []Audit{}, RecycleBin: []DeletedDevice{}}
++
++	// V1.8.0 prefers SQLite. If a completed database already exists, load it
++	// directly. Any SQLite initialization/read problem falls back to the legacy
++	// JSON path so an upgrade cannot prevent the web service from starting.
++	sqliteReady := false
++	if err := initSQLiteStorage(dbPath); err == nil {
++		sqliteReady = true
++		if sqliteMigrationComplete() {
++			if err := loadStateFromSQLite(); err == nil {
++				setSQLitePrimary(true)
++				startupLog("storage: SQLite loaded from %s", dbPath)
++				return nil
++			} else {
++				startupLog("SQLite load failed; falling back to JSON: %v", err)
++				closeSQLiteStorage()
++				sqliteReady = false
++			}
++		}
++	} else {
++		startupLog("SQLite initialization failed; using JSON fallback: %v", err)
++	}
++
++	loadedJSON := false
++	allowMigration := true
+ 	b, err := os.ReadFile(dataPath)
+ 	if err == nil {
+ 		if e := json.Unmarshal(b, &state); e == nil {
+-			if state.Devices == nil {
+-				state.Devices = map[string]*Device{}
+-			}
+-			if state.Users == nil {
+-				state.Users = map[string]*User{}
+-			}
+-			for _, u := range state.Users {
+-				u.Role = strings.ToLower(strings.TrimSpace(u.Role))
+-				if u.Role != "admin" && u.Role != "operator" && u.Role != "viewer" {
+-					u.Role = "viewer"
+-				}
+-			}
+-			if state.Audit == nil {
+-				state.Audit = []Audit{}
+-			}
+-			if state.RecycleBin == nil {
+-				state.RecycleBin = []DeletedDevice{}
+-			}
+-			for mac, d := range state.Devices {
+-				if d == nil {
+-					delete(state.Devices, mac)
+-					continue
+-				}
+-				if d.ActiveLeases == nil {
+-					d.ActiveLeases = []LeaseSnapshot{}
+-				}
+-				if d.OnlineDates == nil {
+-					d.OnlineDates = []string{}
+-				}
+-				if d.MultiLease.Observations == nil {
+-					d.MultiLease.Observations = []LeaseObservation{}
+-				}
+-				if d.MultiLease.StaleIPs == nil {
+-					d.MultiLease.StaleIPs = []string{}
+-				}
+-			}
+-			return nil
++			loadedJSON = true
+ 		} else {
+ 			bad := dataPath + ".invalid_" + time.Now().Format("20060102_150405")
+ 			_ = os.WriteFile(bad, b, 0600)
+-			startupLog("data parse failed; preserved as %s: %v; starting with empty compatible state", bad, e)
+-			return nil
++			startupLog("data parse failed; preserved as %s: %v; SQLite migration cancelled", bad, e)
++			allowMigration = false
++			state = Persist{Devices: map[string]*Device{}, Users: map[string]*User{}, Audit: []Audit{}, RecycleBin: []DeletedDevice{}}
+ 		}
++	} else if !os.IsNotExist(err) {
++		startupLog("data read failed; SQLite migration cancelled: %v", err)
++		allowMigration = false
+ 	}
+-	// Migrate v1.2 dhcp_devices.json when present. Flexible parser for common array/object layouts.
+-	legacy := filepath.Join(baseDir, "dhcp_devices.json")
+-	if lb, e := os.ReadFile(legacy); e == nil {
+-		var raw interface{}
+-		if json.Unmarshal(lb, &raw) == nil {
+-			migrateLegacy(raw)
+-			_ = saveStateLocked()
++	normalizeStateAfterLoad()
++
++	if !loadedJSON && allowMigration {
++		// Migrate the oldest dhcp_devices.json layout when present.
++		legacy := filepath.Join(baseDir, "dhcp_devices.json")
++		if lb, e := os.ReadFile(legacy); e == nil {
++			var raw interface{}
++			if json.Unmarshal(lb, &raw) == nil {
++				migrateLegacy(raw)
++				normalizeStateAfterLoad()
++				_ = saveStateJSONLocked()
++			}
++		}
++	}
++
++	if sqliteReady && allowMigration && sqliteDB != nil && !sqliteMigrationComplete() {
++		if err := migrateCurrentStateToSQLite(); err != nil {
++			startupLog("JSON -> SQLite migration failed; continuing in JSON mode: %v", err)
++			setSQLitePrimary(false)
++		} else {
++			startupLog("JSON -> SQLite migration complete: devices=%d users=%d recycle=%d db=%s", len(state.Devices), len(state.Users), len(state.RecycleBin), dbPath)
+ 		}
+ 	}
+ 	return nil
+@@ -456,9 +509,22 @@
+ 	return r.RemoteAddr
+ }
+ func addAudit(username, action, mac, detail, ip string) {
++	a := Audit{Time: nowISO(), Username: username, Action: action, MAC: mac, Detail: detail, ClientIP: ip}
++	if sqliteIsPrimary() {
++		if err := insertAuditSQLite(a); err == nil {
++			return
++		} else {
++			startupLog("SQLite audit insert failed; retrying through state save: %v", err)
++			mu.Lock()
++			state.Audit = append(state.Audit, a)
++			_ = saveStateLocked()
++			mu.Unlock()
++			return
++		}
++	}
+ 	mu.Lock()
+ 	defer mu.Unlock()
+-	state.Audit = append(state.Audit, Audit{Time: nowISO(), Username: username, Action: action, MAC: mac, Detail: detail, ClientIP: ip})
++	state.Audit = append(state.Audit, a)
+ 	if len(state.Audit) > 10000 {
+ 		state.Audit = state.Audit[len(state.Audit)-10000:]
+ 	}
+@@ -2082,13 +2148,61 @@
+ 	if !ok {
+ 		return
+ 	}
++
++	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
++	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
++	if page < 1 {
++		page = 1
++	}
++	if pageSize != 20 && pageSize != 50 && pageSize != 100 && pageSize != 200 {
++		pageSize = 50
++	}
++	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
++
++	if sqliteIsPrimary() {
++		matched, total, err := queryAuditSQLi
