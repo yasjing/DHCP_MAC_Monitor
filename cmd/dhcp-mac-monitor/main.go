@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -158,6 +159,7 @@ var (
 	cfg          Config
 	baseDir      string
 	dataPath     string
+	dbPath       string
 	state        Persist
 	mu           sync.RWMutex
 	sessions     = map[string]Session{}
@@ -246,7 +248,17 @@ func copyFileIfExists(src, dst string) {
 }
 
 func backupDataOnStartup() {
-	if _, err := os.Stat(dataPath); err != nil {
+	jsonExists := false
+	dbExists := false
+	if _, err := os.Stat(dataPath); err == nil {
+		jsonExists = true
+	}
+	if dbPath != "" {
+		if _, err := os.Stat(dbPath); err == nil {
+			dbExists = true
+		}
+	}
+	if !jsonExists && !dbExists {
 		return
 	}
 	root := filepath.Join(baseDir, "backup")
@@ -254,13 +266,28 @@ func backupDataOnStartup() {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return
 	}
-	copyFileIfExists(dataPath, filepath.Join(dir, filepath.Base(dataPath)))
+	if jsonExists {
+		copyFileIfExists(dataPath, filepath.Join(dir, filepath.Base(dataPath)))
+	}
+	if dbExists {
+		copyFileIfExists(dbPath, filepath.Join(dir, filepath.Base(dbPath)))
+		copyFileIfExists(dbPath+"-wal", filepath.Join(dir, filepath.Base(dbPath)+"-wal"))
+		copyFileIfExists(dbPath+"-shm", filepath.Join(dir, filepath.Base(dbPath)+"-shm"))
+	}
 	copyFileIfExists(filepath.Join(baseDir, "config.json"), filepath.Join(dir, "config.json"))
+
 	entries, err := os.ReadDir(root)
-	if err == nil && len(entries) > 30 {
-		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
-		for _, e := range entries[:len(entries)-30] {
-			if e.IsDir() {
+	if err == nil {
+		regular := make([]os.DirEntry, 0, len(entries))
+		stampDir := regexp.MustCompile(`^\d{8}_\d{6}$`)
+		for _, e := range entries {
+			if e.IsDir() && stampDir.MatchString(e.Name()) {
+				regular = append(regular, e)
+			}
+		}
+		if len(regular) > 30 {
+			sort.Slice(regular, func(i, j int) bool { return regular[i].Name() < regular[j].Name() })
+			for _, e := range regular[:len(regular)-30] {
 				_ = os.RemoveAll(filepath.Join(root, e.Name()))
 			}
 		}
@@ -283,7 +310,7 @@ func requestLog(next http.Handler) http.Handler {
 	})
 }
 
-func saveStateLocked() error {
+func saveStateJSONLocked() error {
 	tmp := dataPath + ".tmp"
 	b, err := json.MarshalIndent(state, "", "  ")
 	if err != nil {
@@ -295,62 +322,88 @@ func saveStateLocked() error {
 	return os.Rename(tmp, dataPath)
 }
 
+func saveEmergencyJSONLocked() {
+	b, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(filepath.Join(baseDir, "dhcp_monitor_emergency.json"), b, 0600)
+}
+
+func saveStateLocked() error {
+	if sqliteIsPrimary() {
+		if err := saveCoreStateSQLiteLocked(); err != nil {
+			saveEmergencyJSONLocked()
+			startupLog("SQLite save failed; emergency JSON written: %v", err)
+			return err
+		}
+		return nil
+	}
+	return saveStateJSONLocked()
+}
+
 func loadState() error {
-	state = Persist{Devices: map[string]*Device{}, Users: map[string]*User{}, Audit: []Audit{}}
+	state = Persist{Devices: map[string]*Device{}, Users: map[string]*User{}, Audit: []Audit{}, RecycleBin: []DeletedDevice{}}
+
+	// V1.8.0 prefers SQLite. If a completed database already exists, load it
+	// directly. Any SQLite initialization/read problem falls back to the legacy
+	// JSON path so an upgrade cannot prevent the web service from starting.
+	sqliteReady := false
+	if err := initSQLiteStorage(dbPath); err == nil {
+		sqliteReady = true
+		if sqliteMigrationComplete() {
+			if err := loadStateFromSQLite(); err == nil {
+				setSQLitePrimary(true)
+				startupLog("storage: SQLite loaded from %s", dbPath)
+				return nil
+			} else {
+				startupLog("SQLite load failed; falling back to JSON: %v", err)
+				closeSQLiteStorage()
+				sqliteReady = false
+			}
+		}
+	} else {
+		startupLog("SQLite initialization failed; using JSON fallback: %v", err)
+	}
+
+	loadedJSON := false
+	allowMigration := true
 	b, err := os.ReadFile(dataPath)
 	if err == nil {
 		if e := json.Unmarshal(b, &state); e == nil {
-			if state.Devices == nil {
-				state.Devices = map[string]*Device{}
-			}
-			if state.Users == nil {
-				state.Users = map[string]*User{}
-			}
-			for _, u := range state.Users {
-				u.Role = strings.ToLower(strings.TrimSpace(u.Role))
-				if u.Role != "admin" && u.Role != "operator" && u.Role != "viewer" {
-					u.Role = "viewer"
-				}
-			}
-			if state.Audit == nil {
-				state.Audit = []Audit{}
-			}
-			if state.RecycleBin == nil {
-				state.RecycleBin = []DeletedDevice{}
-			}
-			for mac, d := range state.Devices {
-				if d == nil {
-					delete(state.Devices, mac)
-					continue
-				}
-				if d.ActiveLeases == nil {
-					d.ActiveLeases = []LeaseSnapshot{}
-				}
-				if d.OnlineDates == nil {
-					d.OnlineDates = []string{}
-				}
-				if d.MultiLease.Observations == nil {
-					d.MultiLease.Observations = []LeaseObservation{}
-				}
-				if d.MultiLease.StaleIPs == nil {
-					d.MultiLease.StaleIPs = []string{}
-				}
-			}
-			return nil
+			loadedJSON = true
 		} else {
 			bad := dataPath + ".invalid_" + time.Now().Format("20060102_150405")
 			_ = os.WriteFile(bad, b, 0600)
-			startupLog("data parse failed; preserved as %s: %v; starting with empty compatible state", bad, e)
-			return nil
+			startupLog("data parse failed; preserved as %s: %v; SQLite migration cancelled", bad, e)
+			allowMigration = false
+			state = Persist{Devices: map[string]*Device{}, Users: map[string]*User{}, Audit: []Audit{}, RecycleBin: []DeletedDevice{}}
+		}
+	} else if !os.IsNotExist(err) {
+		startupLog("data read failed; SQLite migration cancelled: %v", err)
+		allowMigration = false
+	}
+	normalizeStateAfterLoad()
+
+	if !loadedJSON && allowMigration {
+		// Migrate the oldest dhcp_devices.json layout when present.
+		legacy := filepath.Join(baseDir, "dhcp_devices.json")
+		if lb, e := os.ReadFile(legacy); e == nil {
+			var raw interface{}
+			if json.Unmarshal(lb, &raw) == nil {
+				migrateLegacy(raw)
+				normalizeStateAfterLoad()
+				_ = saveStateJSONLocked()
+			}
 		}
 	}
-	// Migrate v1.2 dhcp_devices.json when present. Flexible parser for common array/object layouts.
-	legacy := filepath.Join(baseDir, "dhcp_devices.json")
-	if lb, e := os.ReadFile(legacy); e == nil {
-		var raw interface{}
-		if json.Unmarshal(lb, &raw) == nil {
-			migrateLegacy(raw)
-			_ = saveStateLocked()
+
+	if sqliteReady && allowMigration && sqliteDB != nil && !sqliteMigrationComplete() {
+		if err := migrateCurrentStateToSQLite(); err != nil {
+			startupLog("JSON -> SQLite migration failed; continuing in JSON mode: %v", err)
+			setSQLitePrimary(false)
+		} else {
+			startupLog("JSON -> SQLite migration complete: devices=%d users=%d recycle=%d db=%s", len(state.Devices), len(state.Users), len(state.RecycleBin), dbPath)
 		}
 	}
 	return nil
@@ -456,9 +509,22 @@ func clientIP(r *http.Request) string {
 	return r.RemoteAddr
 }
 func addAudit(username, action, mac, detail, ip string) {
+	a := Audit{Time: nowISO(), Username: username, Action: action, MAC: mac, Detail: detail, ClientIP: ip}
+	if sqliteIsPrimary() {
+		if err := insertAuditSQLite(a); err == nil {
+			return
+		} else {
+			startupLog("SQLite audit insert failed; retrying through state save: %v", err)
+			mu.Lock()
+			state.Audit = append(state.Audit, a)
+			_ = saveStateLocked()
+			mu.Unlock()
+			return
+		}
+	}
 	mu.Lock()
 	defer mu.Unlock()
-	state.Audit = append(state.Audit, Audit{Time: nowISO(), Username: username, Action: action, MAC: mac, Detail: detail, ClientIP: ip})
+	state.Audit = append(state.Audit, a)
 	if len(state.Audit) > 10000 {
 		state.Audit = state.Audit[len(state.Audit)-10000:]
 	}
@@ -2082,13 +2148,61 @@ func apiLogs(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	mu.RLock()
-	a := append([]Audit{}, state.Audit...)
-	mu.RUnlock()
-	for i, j := 0, len(a)-1; i < j; i, j = i+1, j-1 {
-		a[i], a[j] = a[j], a[i]
+
+	page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+	pageSize, _ := strconv.Atoi(r.URL.Query().Get("page_size"))
+	if page < 1 {
+		page = 1
 	}
-	jsonOut(w, map[string]interface{}{"logs": a})
+	if pageSize != 20 && pageSize != 50 && pageSize != 100 && pageSize != 200 {
+		pageSize = 50
+	}
+	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
+
+	if sqliteIsPrimary() {
+		matched, total, err := queryAuditSQLite(page, pageSize, q)
+		if err != nil {
+			jsonErr(w, "Audit database query failed: "+err.Error(), 500)
+			return
+		}
+		totalPages := (total + pageSize - 1) / pageSize
+		if totalPages < 1 {
+			totalPages = 1
+		}
+		jsonOut(w, map[string]interface{}{"logs": matched, "page": page, "page_size": pageSize, "total": total, "total_pages": totalPages, "storage": "sqlite"})
+		return
+	}
+
+	mu.RLock()
+	matched := make([]Audit, 0, pageSize)
+	total := 0
+	start := (page - 1) * pageSize
+	for i := len(state.Audit) - 1; i >= 0; i-- {
+		a := state.Audit[i]
+		if q != "" {
+			haystack := strings.ToLower(strings.Join([]string{a.Username, a.Action, a.MAC, a.Detail, a.ClientIP}, " "))
+			if !strings.Contains(haystack, q) {
+				continue
+			}
+		}
+		if total >= start && len(matched) < pageSize {
+			matched = append(matched, a)
+		}
+		total++
+	}
+	mu.RUnlock()
+
+	totalPages := (total + pageSize - 1) / pageSize
+	if totalPages < 1 {
+		totalPages = 1
+	}
+	jsonOut(w, map[string]interface{}{
+		"logs":        matched,
+		"page":        page,
+		"page_size":   pageSize,
+		"total":       total,
+		"total_pages": totalPages,
+	})
 }
 func logsPage(w http.ResponseWriter, r *http.Request) {
 	u, ok := requireAdmin(w, r)
@@ -2310,6 +2424,7 @@ func apiUserDelete(w http.ResponseWriter, r *http.Request) {
 func main() {
 	baseDir = exeDir()
 	dataPath = filepath.Join(baseDir, "dhcp_monitor_data.json")
+	dbPath = filepath.Join(baseDir, "dhcp_monitor.db")
 	lf, err := os.OpenFile(filepath.Join(baseDir, "startup.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0600)
 	if err == nil {
 		defer lf.Close()
@@ -2323,7 +2438,7 @@ func main() {
 			}
 		}
 	}()
-	startupLog("DHCP MAC Monitor v1.7.1 starting; base=%s", baseDir)
+	startupLog("DHCP MAC Monitor v1.8.0 starting; base=%s", baseDir)
 	if err := loadConfig(); err != nil {
 		startupLog("%v; safe defaults retained", err)
 	}
@@ -2334,7 +2449,11 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/_health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("DHCP MAC Monitor v1.7.1 OK"))
+		storage := "JSON fallback"
+		if sqliteIsPrimary() {
+			storage = "SQLite"
+		}
+		_, _ = w.Write([]byte("DHCP MAC Monitor v1.8.0 OK; storage=" + storage))
 	})
 	mux.HandleFunc("/login", loginPage)
 	mux.HandleFunc("/setup", setupPage)
@@ -2412,7 +2531,12 @@ func main() {
 	}()
 
 	addr := fmt.Sprintf("%s:%d", cfg.Listen, cfg.Port)
-	fmt.Printf("DHCP MAC Monitor v1.7.1\nLocal: http://127.0.0.1:%d\nListening: %s\n", cfg.Port, addr)
+	storageName := "JSON fallback"
+	if sqliteIsPrimary() {
+		storageName = "SQLite (dhcp_monitor.db)"
+	}
+	startupLog("storage ready: %s", storageName)
+	fmt.Printf("DHCP MAC Monitor v1.8.0\nStorage: %s\nLocal: http://127.0.0.1:%d\nListening: %s\n", storageName, cfg.Port, addr)
 	listener, listenErr := net.Listen("tcp", addr)
 	if listenErr != nil {
 		startupLog("port listen failed addr=%s: %v", addr, listenErr)
@@ -2449,7 +2573,7 @@ const layoutFixCSS = `.wrap{max-width:2200px;padding:22px 28px}.top{align-items:
 var dashboardTpl = template.Must(template.New("dash").Parse(`<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>DHCP MAC Manager</title><style>` + baseCSS + layoutFixCSS + `</style></head>
 <body><div class="wrap">
-<div class="top"><div class="brand"><h1 data-i="title">DHCP MAC 设备管理 V1.7.1</h1><div class="muted" data-i="sub">DHCP Allow 实时管理 + Lease 检测 + Deny 同步</div></div><div class="nav"><span class="muted">{{.Username}} ({{.Role}})</span><select id="lang"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select><a class="btn" href="/reservations">固定 IP / VLAN</a>{{if .IsAdmin}}<a class="btn" href="/logs" data-i="logs">审核日志</a><a class="btn" href="/users" data-i="users">账号管理</a><button class="btn danger" onclick="deleteDisabled()">一键删除已停用</button><a class="btn" href="/recycle">回收站</a>{{end}}<a class="btn" href="/api/export" data-i="export">导出 CSV</a>{{if .IsAdmin}}<button id="importBtn" class="btn" onclick="document.getElementById('file').click()" data-i="import">导入 CSV</button><input id="file" type="file" accept=".csv,text/csv" style="display:none" onchange="importCSV(this)">{{end}}{{if .CanEdit}}<button id="syncBtn" class="btn" onclick="syncNow()" data-i="sync">立即同步</button><button id="addBtn" class="btn primary" onclick="openAdd()" data-i="add">+ 添加 MAC</button>{{end}}<a class="btn" href="/logout" data-i="logout">退出</a></div></div>
+<div class="top"><div class="brand"><h1 data-i="title">DHCP MAC 设备管理 V1.8.0</h1><div class="muted" data-i="sub">DHCP Allow 实时管理 + Lease 检测 + Deny 同步</div></div><div class="nav"><span class="muted">{{.Username}} ({{.Role}})</span><select id="lang"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select><a class="btn" href="/reservations">固定 IP / VLAN</a>{{if .IsAdmin}}<a class="btn" href="/logs" data-i="logs">审核日志</a><a class="btn" href="/users" data-i="users">账号管理</a><button class="btn danger" onclick="deleteDisabled()">一键删除已停用</button><a class="btn" href="/recycle">回收站</a>{{end}}<a class="btn" href="/api/export" data-i="export">导出 CSV</a>{{if .IsAdmin}}<button id="importBtn" class="btn" onclick="document.getElementById('file').click()" data-i="import">导入 CSV</button><input id="file" type="file" accept=".csv,text/csv" style="display:none" onchange="importCSV(this)">{{end}}{{if .CanEdit}}<button id="syncBtn" class="btn" onclick="syncNow()" data-i="sync">立即同步</button><button id="addBtn" class="btn primary" onclick="openAdd()" data-i="add">+ 添加 MAC</button>{{end}}<a class="btn" href="/logout" data-i="logout">退出</a></div></div>
 <div class="cards"><div class="stat total"><span class="statLabel" data-i="total">管理 MAC 总数</span><b id="nTotal">0</b><small data-i="totalHint">Allow 与 Deny 管理记录</small></div><div class="stat ok"><span class="statLabel" data-i="ok">在线3天以内</span><b id="nOk">0</b><small data-i="okHint">连续在线 ≤ 3天</small></div><div class="stat warn"><span class="statLabel" data-i="d3">在线超过3天</span><b id="n3">0</b><small data-i="d3Hint">连续在线 >3天 且 ≤7天</small></div><div class="stat dangerStat"><span class="statLabel" data-i="d7">在线超过7天</span><b id="n7">0</b><small data-i="d7Hint">连续在线 > 7天</small></div><div class="stat offlineStat"><span class="statLabel" data-i="offline">当前离线</span><b id="nOffline">0</b><small data-i="offlineHint">连续两次检查未发现</small></div><div class="stat neverStat"><span class="statLabel" data-i="never">从未连接</span><b id="nNever">0</b><small data-i="neverHint">添加后从未在 DHCP 发现</small></div><div class="stat disabledStat"><span class="statLabel" data-i="disabled">已停用</span><b id="nDisabled">0</b><small data-i="disabledHint">MAC 已移动到 Deny</small></div></div>
 <div class="panel"><div class="tools"><input id="q" data-ph="search" oninput="page=1;render()"><div class="tabs"><button class="btn activeTab" onclick="setFilter('all',this)" data-i="all">全部</button><button class="btn" onclick="setFilter('normal',this)" data-i="onlyNormal">在线≤3天</button><button class="btn" onclick="setFilter('over3',this)" data-i="only3">在线>3天</button><button class="btn" onclick="setFilter('over7',this)" data-i="only7">在线>7天</button><button class="btn" onclick="setFilter('offline',this)" data-i="onlyOffline">当前离线</button><button class="btn" onclick="setFilter('never',this)" data-i="onlyNever">从未连接</button><button class="btn" onclick="setFilter('disabled',this)" data-i="onlyDisabled">已停用</button></div>{{if .IsAdmin}}<button id="disableNeverBtn" class="btn danger" style="display:none" onclick="disableNever()" data-i="disableNever">一键停用从未连接</button>{{end}}<button class="btn soft" onclick="openLegend()" data-i="legend">状态说明</button></div><div class="syncBar"><span id="syncMsg" class="muted"></span></div>
 <div class="tableWrap"><table class="deviceTable"><thead><tr><th data-i="status">状态</th><th>MAC</th><th data-i="name">用户名/设备名</th><th data-i="note">备注 / Allow Description</th><th data-i="ip">最后 IP</th><th data-i="scope">网段</th><th data-i="onlineSince">本次上线</th><th data-i="lastDetected">最后检测</th><th data-i="stateDuration">连续状态</th><th data-i="leaseInfo">Lease 信息</th><th data-i="creator">添加账号</th><th data-i="act">操作</th></tr></thead><tbody id="rows"></tbody></table></div><div class="pagebar"><span id="pageInfo" class="muted"></span><button id="prevBtn" class="btn" onclick="changePage(-1)">‹</button><button id="nextBtn" class="btn" onclick="changePage(1)">›</button><select id="pageSize" onchange="setPageSize(this.value)"><option value="50">50 / 页</option><option value="100" selected>100 / 页</option><option value="200">200 / 页</option></select></div></div></div>
@@ -2495,6 +2619,91 @@ var reservationsPageTpl2 = template.Must(template.New("reservations2").Parse(`<!
 
 var recyclePageTpl2 = template.Must(template.New("recycle2").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>MAC Recycle Bin</title><style>` + baseCSS + layoutFixCSS + `</style></head><body><div class="wrap"><div class="top"><div class="brand"><h1 data-i="title"></h1><div class="muted" data-i="subtitle"></div></div><div class="nav"><select id="lang"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select><a class="btn" href="/" data-i="back"></a></div></div><div class="panel" style="margin-top:18px"><div class="tools"><input id="q" data-ph="search" oninput="render()"><span id="count" class="muted"></span></div><div class="tableWrap"><table style="min-width:1100px"><thead><tr><th data-i="deletedAt"></th><th>MAC</th><th data-i="device"></th><th data-i="before"></th><th data-i="fixed"></th><th data-i="deletedBy"></th><th data-i="reason"></th><th data-i="action"></th></tr></thead><tbody id="rows"></tbody></table></div></div></div><script>const L={zh:{title:'MAC 回收站',subtitle:'仅 admin 可见 · 完整删除快照与 Reservation 恢复',back:'返回主页',search:'搜索 MAC / 用户名 / 删除账号',deletedAt:'删除时间',device:'用户名/设备名',before:'删除前状态',fixed:'固定 IP',deletedBy:'删除账号',reason:'原因',action:'操作',disabled:'已停用',enabled:'启用',restore:'恢复完整快照',empty:'回收站为空',items:'条',ask:'恢复完整资料和固定 IP？',okFixed:'恢复成功（含固定 IP）',okNoFixed:'MAC 已恢复；原固定 IP 冲突或恢复失败，请重新绑定',failed:'恢复失败'},en:{title:'MAC Recycle Bin',subtitle:'Admin only · complete snapshots and reservation recovery',back:'Dashboard',search:'Search MAC / device / deleted by',deletedAt:'Deleted at',device:'User / device',before:'Previous status',fixed:'Fixed IP',deletedBy:'Deleted by',reason:'Reason',action:'Actions',disabled:'Disabled',enabled:'Enabled',restore:'Restore snapshot',empty:'Recycle bin is empty',items:'items',ask:'Restore full details and fixed IP?',okFixed:'Restored, including fixed IP',okNoFixed:'MAC restored; fixed IP conflicted or could not be restored',failed:'Restore failed'},vi:{title:'Thùng rác MAC',subtitle:'Chỉ admin · khôi phục ảnh chụp đầy đủ và Reservation',back:'Trang chính',search:'Tìm MAC / thiết bị / người xóa',deletedAt:'Thời gian xóa',device:'Người dùng / thiết bị',before:'Trạng thái trước',fixed:'IP cố định',deletedBy:'Người xóa',reason:'Lý do',action:'Thao tác',disabled:'Đã tắt',enabled:'Đang bật',restore:'Khôi phục đầy đủ',empty:'Thùng rác trống',items:'mục',ask:'Khôi phục đầy đủ và IP cố định?',okFixed:'Đã khôi phục gồm IP cố định',okNoFixed:'Đã khôi phục MAC; IP cố định bị xung đột hoặc không thể khôi phục',failed:'Khôi phục thất bại'}};let lang=localStorage.getItem('lang')||'zh',items=[];const $=x=>document.getElementById(x),t=k=>L[lang][k]||L.zh[k]||k,e=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));function apply(){document.querySelectorAll('[data-i]').forEach(x=>x.textContent=t(x.dataset.i));document.querySelectorAll('[data-ph]').forEach(x=>x.placeholder=t(x.dataset.ph));render()}$('lang').value=lang;$('lang').onchange=x=>{lang=x.target.value;localStorage.setItem('lang',lang);apply()};async function load(){let r=await fetch('/api/recycle'),x=await r.json();if(!r.ok){location='/';return}items=(x.items||[]).reverse();apply()}function render(){let q=$('q').value.toLowerCase(),a=items.filter(x=>!q||[x.snapshot.mac,x.snapshot.name,x.deleted_by,x.reason].join(' ').toLowerCase().includes(q));$('count').textContent=a.length+' '+t('items');$('rows').innerHTML=a.map(x=>'<tr><td>'+new Date(x.deleted_at).toLocaleString()+'</td><td><b>'+e(x.snapshot.mac)+'</b></td><td>'+e(x.snapshot.name||'-')+'</td><td>'+t(x.snapshot.disabled?'disabled':'enabled')+'</td><td>'+e(x.snapshot.reservation?x.snapshot.reservation.ip:'-')+'</td><td>'+e(x.deleted_by)+'</td><td>'+e(x.reason)+'</td><td><button class="btn primary" onclick="restore(\''+e(x.snapshot.mac)+'\')">'+t('restore')+'</button></td></tr>').join('')||'<tr><td colspan="8" class="muted">'+t('empty')+'</td></tr>'}async function restore(mac){if(!confirm(mac+' · '+t('ask')))return;let r=await fetch('/api/recycle/restore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({MAC:mac})}),x=await r.json();if(!r.ok)alert(x.error||t('failed'));else{alert(x.reservation_restored?t('okFixed'):t('okNoFixed'));load()}}load()</script></body></html>`))
 
-var logsTpl = template.Must(template.New("logs").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Audit Logs</title><style>` + baseCSS + layoutFixCSS + `</style></head><body><div class="wrap"><div class="top"><div><h1>Audit Logs / 审核日志 / Nhật ký</h1><div class="muted">Signed in: {{.Username}}</div></div><div><a class="btn" href="/">Dashboard</a> <a class="btn" href="/api/export">Export MAC CSV</a></div></div><div class="panel" style="margin-top:20px"><div class="tools"><input id="q" placeholder="Search user / action / MAC / detail" oninput="render()"></div><div class="tableWrap"><table><thead><tr><th>Time</th><th>Account</th><th>Action</th><th>MAC</th><th>Detail</th><th>Client IP</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><script>let logs=[];const $=x=>document.getElementById(x);function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function load(){let r=await fetch('/api/logs');if(r.status===401||r.status===403){location='/';return}let x=await r.json();logs=x.logs||[];render()}function render(){let q=$('q').value.toLowerCase();$('rows').innerHTML=logs.filter(x=>!q||[x.username,x.action,x.mac,x.detail,x.client_ip].join(' ').toLowerCase().includes(q)).map(x=>'<tr><td>'+new Date(x.time).toLocaleString()+'</td><td><b>'+esc(x.username)+'</b></td><td>'+esc(x.action)+'</td><td>'+esc(x.mac||'-')+'</td><td>'+esc(x.detail)+'</td><td>'+esc(x.client_ip)+'</td></tr>').join('')}load()</script></body></html>`))
+var logsTpl = template.Must(template.New("logs").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Audit Logs</title><style>` + baseCSS + layoutFixCSS + `
+.auditPanel{margin-top:20px}.auditTools{display:flex;gap:10px;align-items:center;flex-wrap:wrap}.auditTools input{min-width:280px;flex:1}.pagebar{display:flex;align-items:center;justify-content:flex-end;gap:8px;padding:12px 14px;border-top:1px solid #e8edf5;flex-wrap:wrap}.pagebar select{height:36px;border:1px solid #d7deea;border-radius:9px;background:#fff;padding:0 9px}.pagebar .btn:disabled{opacity:.45;cursor:not-allowed}.audit-action{font-weight:600}.audit-detail{white-space:normal;line-height:1.45;min-width:340px}@media(max-width:760px){.auditTools input{min-width:100%}.pagebar{justify-content:center}.audit-detail{min-width:260px}}
+</style></head><body><div class="wrap"><div class="top"><div><h1 data-i="title">审核日志</h1><div class="muted"><span data-i="signed">当前账号</span>: {{.Username}}</div></div><div class="nav"><select id="lang"><option value="zh">中文</option><option value="en">English</option><option value="vi">Tiếng Việt</option></select><a class="btn" href="/" data-i="dashboard">返回主页</a><a class="btn" href="/api/export" data-i="export">导出 MAC CSV</a></div></div><div class="panel auditPanel"><div class="tools auditTools"><input id="q" data-ph="search"><button class="btn" onclick="searchLogs()" data-i="searchBtn">搜索</button></div><div class="tableWrap"><table><thead><tr><th data-i="time">时间</th><th data-i="account">账号</th><th data-i="action">操作</th><th>MAC</th><th data-i="detail">详情</th><th data-i="clientIP">客户端 IP</th></tr></thead><tbody id="rows"></tbody></table></div><div class="pagebar"><span id="pageInfo" class="muted"></span><button id="prevBtn" class="btn" onclick="changePage(-1)">‹</button><button id="nextBtn" class="btn" onclick="changePage(1)">›</button><select id="pageSize" onchange="setPageSize(this.value)"><option value="20">20</option><option value="50" selected>50</option><option value="100">100</option><option value="200">200</option></select></div></div></div><script>
+let logs=[],page=1,pageSize=50,total=0,totalPages=1,lang=localStorage.getItem('lang')||'zh',timer;const $=x=>document.getElementById(x);
+const L={
+zh:{title:'审核日志',signed:'当前账号',dashboard:'返回主页',export:'导出 MAC CSV',search:'搜索账号 / 操作 / MAC / 详情 / IP',searchBtn:'搜索',time:'时间',account:'账号',action:'操作',detail:'详情',clientIP:'客户端 IP',page:'页',records:'条记录',empty:'没有找到日志',perPage:'每页'},
+en:{title:'Audit Logs',signed:'Signed in',dashboard:'Dashboard',export:'Export MAC CSV',search:'Search account / action / MAC / detail / IP',searchBtn:'Search',time:'Time',account:'Account',action:'Action',detail:'Detail',clientIP:'Client IP',page:'page',records:'records',empty:'No audit logs found',perPage:'per page'},
+vi:{title:'Nhật ký kiểm tra',signed:'Tài khoản hiện tại',dashboard:'Trang chính',export:'Xuất MAC CSV',search:'Tìm tài khoản / thao tác / MAC / chi tiết / IP',searchBtn:'Tìm kiếm',time:'Thời gian',account:'Tài khoản',action:'Thao tác',detail:'Chi tiết',clientIP:'IP máy khách',page:'trang',records:'bản ghi',empty:'Không tìm thấy nhật ký',perPage:'mỗi trang'}
+};
+const A={
+zh:{login:'登录',login_failed:'登录失败',logout:'退出登录',setup_admin:'创建初始管理员',add_mac:'添加 MAC',add_mac_failed:'添加 MAC 失败',update_mac:'修改 MAC',update_mac_failed:'修改 MAC 失败',delete_mac:'删除 MAC',delete_mac_failed:'删除 MAC 失败',bulk_delete_disabled:'批量删除已停用 MAC',bulk_delete_disabled_failed:'批量删除已停用 MAC 失败',recover_deleted_mac:'从回收站恢复 MAC',enable_mac:'启用 MAC',disable_mac:'停用 MAC',restore_deny_to_allow:'从黑名单恢复到白名单',reservation_create:'创建固定 IP',reservation_failed:'创建固定 IP 失败',reservation_delete:'删除固定 IP',reservation_delete_failed:'删除固定 IP 失败',release_stale_lease:'释放旧租约',bulk_disable_never:'批量停用从未连接 MAC',bulk_disable_never_failed:'批量停用从未连接 MAC 失败',sync:'立即同步',export_csv:'导出 CSV',import_csv:'导入 CSV',add_mac_import:'导入添加 MAC',update_mac_import:'导入更新 MAC',add_user:'添加账号',reset_password:'重置密码',toggle_user:'启用/停用账号',change_user_role:'修改账号角色',delete_user:'删除账号',sync_add_mac:'同步发现白名单 MAC',sync_enable_mac:'同步启用 MAC',sync_update_mac:'同步更新白名单 MAC',sync_add_deny_mac:'同步发现黑名单 MAC',sync_disable_mac:'同步停用 MAC',sync_update_deny_mac:'同步更新黑名单 MAC'},
+en:{login:'Login',login_failed:'Login failed',logout:'Logout',setup_admin:'Create initial administrator',add_mac:'Add MAC',add_mac_failed:'Add MAC failed',update_mac:'Update MAC',update_mac_failed:'Update MAC failed',delete_mac:'Delete MAC',delete_mac_failed:'Delete MAC failed',bulk_delete_disabled:'Bulk delete disabled MACs',bulk_delete_disabled_failed:'Bulk delete disabled MACs failed',recover_deleted_mac:'Restore MAC from recycle bin',enable_mac:'Enable MAC',disable_mac:'Disable MAC',restore_deny_to_allow:'Restore Deny to Allow',reservation_create:'Create reservation',reservation_failed:'Create reservation failed',reservation_delete:'Delete reservation',reservation_delete_failed:'Delete reservation failed',release_stale_lease:'Release stale lease',bulk_disable_never:'Bulk disable never-connected MACs',bulk_disable_never_failed:'Bulk disable never-connected MACs failed',sync:'Sync',export_csv:'Export CSV',import_csv:'Import CSV',add_mac_import:'Add MAC by import',update_mac_import:'Update MAC by import',add_user:'Add account',reset_password:'Reset password',toggle_user:'Enable/disable account',change_user_role:'Change account role',delete_user:'Delete account',sync_add_mac:'Discover Allow MAC',sync_enable_mac:'Enable MAC by sync',sync_update_mac:'Update Allow MAC by sync',sync_add_deny_mac:'Discover Deny MAC',sync_disable_mac:'Disable MAC by sync',sync_update_deny_mac:'Update Deny MAC by sync'},
+vi:{login:'Đăng nhập',login_failed:'Đăng nhập thất bại',logout:'Đăng xuất',setup_admin:'Tạo quản trị viên ban đầu',add_mac:'Thêm MAC',add_mac_failed:'Thêm MAC thất bại',update_mac:'Cập nhật MAC',update_mac_failed:'Cập nhật MAC thất bại',delete_mac:'Xóa MAC',delete_mac_failed:'Xóa MAC thất bại',bulk_delete_disabled:'Xóa hàng loạt MAC đã tắt',bulk_delete_disabled_failed:'Xóa hàng loạt MAC đã tắt thất bại',recover_deleted_mac:'Khôi phục MAC từ thùng rác',enable_mac:'Bật MAC',disable_mac:'Tắt MAC',restore_deny_to_allow:'Khôi phục Deny sang Allow',reservation_create:'Tạo IP cố định',reservation_failed:'Tạo IP cố định thất bại',reservation_delete:'Xóa IP cố định',reservation_delete_failed:'Xóa IP cố định thất bại',release_stale_lease:'Giải phóng lease cũ',bulk_disable_never:'Tắt hàng loạt MAC chưa từng kết nối',bulk_disable_never_failed:'Tắt hàng loạt MAC chưa từng kết nối thất bại',sync:'Đồng bộ',export_csv:'Xuất CSV',import_csv:'Nhập CSV',add_mac_import:'Thêm MAC bằng nhập CSV',update_mac_import:'Cập nhật MAC bằng nhập CSV',add_user:'Thêm tài khoản',reset_password:'Đặt lại mật khẩu',toggle_user:'Bật/tắt tài khoản',change_user_role:'Đổi vai trò tài khoản',delete_user:'Xóa tài khoản',sync_add_mac:'Phát hiện MAC trong Allow',sync_enable_mac:'Bật MAC khi đồng bộ',sync_update_mac:'Cập nhật MAC Allow',sync_add_deny_mac:'Phát hiện MAC trong Deny',sync_disable_mac:'Tắt MAC khi đồng bộ',sync_update_deny_mac:'Cập nhật MAC Deny'}
+};
+function t(k){return (L[lang]||L.zh)[k]||k}
+function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function trAction(s){return (A[lang]||A.zh)[s]||s}
+function trBool(v){if(lang==='zh')return v==='true'?'是':'否';if(lang==='vi')return v==='true'?'Có':'Không';return v}
+function trDetail(s){
+  s=String(s||''); if(lang==='en') return s;
+  const zh=lang==='zh';
+  const exact={
+    'Successful login':zh?'登录成功':'Đăng nhập thành công',
+    'Failed login':zh?'登录失败':'Đăng nhập thất bại',
+    'Logged out':zh?'已退出登录':'Đã đăng xuất',
+    'Initial admin created':zh?'已创建初始管理员':'Đã tạo quản trị viên ban đầu',
+    'Moved MAC from DHCP Deny to Allow':zh?'已将 MAC 从 DHCP 黑名单移到白名单':'Đã chuyển MAC từ DHCP Deny sang Allow',
+    'Moved MAC from DHCP Allow to Deny':zh?'已将 MAC 从 DHCP 白名单移到黑名单':'Đã chuyển MAC từ DHCP Allow sang Deny',
+    'Existing Deny MAC enabled and details updated':zh?'已启用黑名单中已有的 MAC，并更新用户名/设备名和备注':'Đã bật MAC có sẵn trong Deny và cập nhật tên/ghi chú',
+    'Exported MAC list':zh?'已导出 MAC 清单':'Đã xuất danh sách MAC',
+    'Detected MAC in Windows DHCP Allow':zh?'在 Windows DHCP 白名单中发现 MAC':'Phát hiện MAC trong Windows DHCP Allow',
+    'Detected MAC in DHCP Allow; local status changed to enabled':zh?'在 DHCP 白名单中发现 MAC，本地状态已改为启用':'Phát hiện MAC trong DHCP Allow; trạng thái cục bộ đã chuyển sang bật',
+    'Detected MAC in Windows DHCP Deny':zh?'在 Windows DHCP 黑名单中发现 MAC':'Phát hiện MAC trong Windows DHCP Deny',
+    'Detected MAC in DHCP Deny; local status changed to disabled':zh?'在 DHCP 黑名单中发现 MAC，本地状态已改为停用':'Phát hiện MAC trong DHCP Deny; trạng thái cục bộ đã chuyển sang tắt',
+    'Full snapshot saved to recycle bin':zh?'完整设备快照已保存到 MAC 回收站':'Đã lưu ảnh chụp đầy đủ của thiết bị vào thùng rác MAC',
+    'Never-connected MAC moved from DHCP Allow to Deny':zh?'从未连接的 MAC 已从 DHCP 白名单移到黑名单':'MAC chưa từng kết nối đã được chuyển từ DHCP Allow sang Deny'
+  };
+  if(exact[s]) return exact[s];
+  let m;
+  if((m=s.match(/^Released after two clear checks 30 minutes apart: (.*)$/))) return (zh?'经过两次相隔30分钟的明确检查后，已释放旧租约：':'Đã giải phóng lease cũ sau hai lần kiểm tra rõ ràng cách nhau 30 phút: ')+m[1];
+  if((m=s.match(/^Allow Description: (.*) -> (.*)$/))) return (zh?'白名单备注：':'Mô tả Allow: ')+m[1]+' → '+m[2];
+  if((m=s.match(/^Deny Description: (.*) -> (.*)$/))) return (zh?'黑名单备注：':'Mô tả Deny: ')+m[1]+' → '+m[2];
+  if((m=s.match(/^DHCP Allow write failed: (.*)$/))) return (zh?'写入 DHCP 白名单失败：':'Ghi DHCP Allow thất bại: ')+m[1];
+  if((m=s.match(/^Added to DHCP Allow; name=(.*); note=(.*)$/))) return (zh?'已添加到 DHCP 白名单；用户名/设备名=':'Đã thêm vào DHCP Allow; tên người dùng/thiết bị=')+m[1]+(zh?'；备注=':'; ghi chú=')+m[2];
+  if((m=s.match(/^DHCP filter update failed: (.*)$/))) return (zh?'更新 DHCP 过滤器失败：':'Cập nhật bộ lọc DHCP thất bại: ')+m[1];
+  if((m=s.match(/^Name (.*) -> (.*); note (.*) -> (.*); list=(Allow|Deny)$/))) return (zh?'用户名/设备名 ':'Tên người dùng/thiết bị ')+m[1]+' → '+m[2]+(zh?'；备注 ':'; ghi chú ')+m[3]+' → '+m[4]+(zh?'；列表=':'; danh sách=')+m[5];
+  if((m=s.match(/^DHCP remove failed: (.*)$/))) return (zh?'从 DHCP 删除失败：':'Xóa khỏi DHCP thất bại: ')+m[1];
+  if((m=s.match(/^Deleted from DHCP filter and local database; before: (.*)$/))) return (zh?'已从 DHCP 过滤器和本地数据库删除；删除前快照：':'Đã xóa khỏi bộ lọc DHCP và cơ sở dữ liệu cục bộ; ảnh chụp trước khi xóa: ')+m[1];
+  if((m=s.match(/^Restored full snapshot; reservation_restored=(true|false)$/))) return (zh?'已恢复完整快照；固定 IP 恢复=':'Đã khôi phục ảnh chụp đầy đủ; khôi phục IP cố định=')+trBool(m[1]);
+  if((m=s.match(/^DHCP move failed: (.*)$/))) return (zh?'DHCP 白/黑名单移动失败：':'Chuyển DHCP Allow/Deny thất bại: ')+m[1];
+  if((m=s.match(/^Batch DHCP operation failed: (.*)$/))) return (zh?'批量 DHCP 操作失败：':'Thao tác DHCP hàng loạt thất bại: ')+m[1];
+  if((m=s.match(/^DHCP move to Deny failed: (.*)$/))) return (zh?'移动到 DHCP 黑名单失败：':'Chuyển sang DHCP Deny thất bại: ')+m[1];
+  if((m=s.match(/^Full sync complete: (.*)$/))) return (zh?'完整同步完成：':'Hoàn tất đồng bộ đầy đủ: ')+m[1];
+  if((m=s.match(/^Imported (\d+) MAC rows to DHCP Allow\/Deny; skipped (\d+) invalid rows$/))) return zh?('已导入 '+m[1]+' 条 MAC 到 DHCP 白/黑名单；跳过 '+m[2]+' 条无效记录'):('Đã nhập '+m[1]+' MAC vào DHCP Allow/Deny; bỏ qua '+m[2]+' bản ghi không hợp lệ');
+  if((m=s.match(/^Added by CSV import; enabled=(true|false); note=(.*)$/))) return (zh?'通过 CSV 导入新增；启用=':'Đã thêm bằng CSV; bật=')+trBool(m[1])+(zh?'；备注=':'; ghi chú=')+m[2];
+  if((m=s.match(/^Updated by CSV import; enabled=(true|false); note: (.*) -> (.*)$/))) return (zh?'通过 CSV 导入更新；启用=':'Đã cập nhật bằng CSV; bật=')+trBool(m[1])+(zh?'；备注：':'； ghi chú: ')+m[2]+' → '+m[3];
+  if((m=s.match(/^Created user (.*) role=(.*)$/))) return (zh?'已创建账号 ':'Đã tạo tài khoản ')+m[1]+(zh?'，角色=':', vai trò=')+m[2];
+  if((m=s.match(/^Reset password and invalidated active sessions for (.*)$/))) return (zh?'已重置密码并使该账号现有会话失效：':'Đã đặt lại mật khẩu và vô hiệu hóa phiên đang hoạt động của: ')+m[1];
+  if((m=s.match(/^User (.*) enabled: (true|false) -> (true|false); invalidated_sessions=(\d+)$/))) return (zh?'账号 ':'Tài khoản ')+m[1]+(zh?' 启用状态：':' trạng thái bật: ')+trBool(m[2])+' → '+trBool(m[3])+(zh?'；失效会话数=':'; số phiên bị vô hiệu=')+m[4];
+  if((m=s.match(/^Changed user (.*) role: (.*) -> (.*)$/))) return (zh?'已修改账号 ':'Đã đổi tài khoản ')+m[1]+(zh?' 的角色：':' vai trò: ')+m[2]+' → '+m[3];
+  if((m=s.match(/^Deleted user (.*)$/))) return (zh?'已删除账号 ':'Đã xóa tài khoản ')+m[1];
+  if((m=s.match(/^IP=(.*) Scope=(.*) VLAN=(.*)$/))) return (zh?'固定 IP=':'IP cố định=')+m[1]+(zh?'；网段=':'; Scope=')+m[2]+'；VLAN='+m[3];
+  if((m=s.match(/^IP=(.*) Scope=(.*)$/))) return 'IP='+m[1]+(zh?'；网段=':'; Scope=')+m[2];
+  return s;
+}
+function apply(){
+  document.documentElement.lang=lang==='zh'?'zh-CN':lang==='vi'?'vi':'en';
+  document.title=t('title');
+  document.querySelectorAll('[data-i]').forEach(e=>e.textContent=t(e.dataset.i));
+  document.querySelectorAll('[data-ph]').forEach(e=>e.placeholder=t(e.dataset.ph));
+  Array.from($('pageSize').options).forEach(o=>o.text=o.value+' / '+t('page'));
+  render();
+}
+async function load(){
+  let u=new URL('/api/logs',location.origin);u.searchParams.set('page',page);u.searchParams.set('page_size',pageSize);let q=$('q').value.trim();if(q)u.searchParams.set('q',q);
+  let r=await fetch(u,{cache:'no-store'});if(r.status===401||r.status===403){location='/';return}let x=await r.json();logs=x.logs||[];total=Number(x.total||0);totalPages=Number(x.total_pages||1);page=Number(x.page||1);render();
+}
+function render(){
+  $('rows').innerHTML=logs.map(x=>'<tr><td>'+new Date(x.time).toLocaleString(lang==='zh'?'zh-CN':lang==='vi'?'vi-VN':'en-US')+'</td><td><b>'+esc(x.username)+'</b></td><td class="audit-action">'+esc(trAction(x.action))+'</td><td>'+esc(x.mac||'-')+'</td><td class="audit-detail">'+esc(trDetail(x.detail))+'</td><td>'+esc(x.client_ip)+'</td></tr>').join('')||'<tr><td colspan="6" class="muted" style="text-align:center;padding:34px">'+t('empty')+'</td></tr>';
+  $('pageInfo').textContent=page+' / '+totalPages+' '+t('page')+' · '+total+' '+t('records');$('prevBtn').disabled=page<=1;$('nextBtn').disabled=page>=totalPages;
+}
+function searchLogs(){page=1;load()}
+function changePage(n){let p=page+n;if(p<1||p>totalPages)return;page=p;load()}
+function setPageSize(v){pageSize=Number(v)||50;page=1;load()}
+$('q').addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(searchLogs,350)});$('q').addEventListener('keydown',e=>{if(e.key==='Enter'){clearTimeout(timer);searchLogs()}});$('lang').value=lang;$('lang').onchange=e=>{lang=e.target.value;localStorage.setItem('lang',lang);apply()};apply();load();
+</script></body></html>`))
 
 var usersTpl = template.Must(template.New("users").Parse(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width"><title>Accounts</title><style>` + baseCSS + `</style></head><body><div class="wrap"><div class="top"><div><h1>Account Management / 账号管理</h1><div class="muted">admin / operator / viewer</div></div><a class="btn" href="/">Dashboard</a></div><div class="panel" style="margin-top:20px"><div class="tools"><button class="btn primary" onclick="addUser()">+ Add account</button></div><div class="tableWrap"><table><thead><tr><th>Username</th><th>Role</th><th>Enabled</th><th>Created by</th><th>Created at</th><th>Actions</th></tr></thead><tbody id="rows"></tbody></table></div></div></div><script>let users=[];function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function load(){let r=await fetch('/api/users');if(!r.ok){location='/';return}let x=await r.json();users=x.users||[];document.getElementById('rows').innerHTML=users.map(u=>'<tr><td><b>'+esc(u.username)+'</b></td><td>'+esc(u.role)+'</td><td>'+(u.enabled?'Yes':'No')+'</td><td>'+esc(u.created_by)+'</td><td>'+new Date(u.created_at).toLocaleString()+'</td><td><button class="btn" onclick="resetPw(\''+esc(u.username)+'\')">Reset password</button> <button class="btn" onclick="changeRole(\''+esc(u.username)+'\',\''+esc(u.role)+'\')">Change role</button> <button class="btn" onclick="toggle(\''+esc(u.username)+'\','+(!u.enabled)+')">'+(u.enabled?'Disable':'Enable')+'</button> <button class="btn danger" onclick="delUser(\''+esc(u.username)+'\')">Delete</button></td></tr>').join('')}async function addUser(){let username=prompt('Username');if(!username)return;let password=prompt('Password (8+)');if(!password)return;let role=prompt('Role: admin / operator / viewer','operator')||'operator';let r=await fetch('/api/users/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Username:username,Password:password,Role:role})});let x=await r.json();if(!r.ok)alert(x.error);load()}async function resetPw(username){let password=prompt('New password (8+)');if(!password)return;let r=await fetch('/api/users/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Username:username,Password:password})});let x=await r.json();if(!r.ok)alert(x.error);else alert('OK')}async function changeRole(username,current){let role=prompt('Role: admin / operator / viewer',current);if(!role)return;let r=await fetch('/api/users/role',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Username:username,Role:role})});let x=await r.json();if(!r.ok)alert(x.error);load()}async function delUser(username){if(!confirm('Delete account '+username+'?'))return;let r=await fetch('/api/users/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Username:username})});let x=await r.json();if(!r.ok)alert(x.error);load()}async function toggle(username,enabled){let r=await fetch('/api/users/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({Username:username,Enabled:enabled})});let x=await r.json();if(!r.ok)alert(x.error);load()}load()</script></body></html>`))

@@ -1,0 +1,46 @@
+# DHCP MAC Monitor V1.8.0 SQLite 升级说明
+
+推荐先备份整个旧目录，再只替换 EXE。
+
+第一次启动会自动执行：
+
+`dhcp_monitor_data.json` → 创建迁移前备份 → 创建 `dhcp_monitor.db` → 导入设备 / 账号 / 审核日志 / 回收站 → 核对记录数 → 成功后切换到 SQLite。
+
+## 升级步骤
+
+1. 停止旧版 `DHCP_MAC_Monitor.exe`。
+2. 复制整个现有程序目录作为额外备份。
+3. 使用 `DHCP_MAC_Monitor_v1.8.0_UPDATE_ONLY.zip` 时，只替换 `DHCP_MAC_Monitor.exe`。
+4. 不要覆盖 `config.json`，不要删除 `dhcp_monitor_data.json`。
+5. 右键新版 EXE，选择“以管理员身份运行”。
+6. 第一次启动等待自动迁移完成，不要强制结束进程。
+7. 浏览器访问 `http://服务器IP:8888`，第一次建议 `Ctrl+F5`。
+
+## 如何确认 SQLite 已启用
+
+程序目录出现：
+
+`dhcp_monitor.db`
+
+并且 `startup.log` 出现：
+
+```text
+JSON -> SQLite migration complete
+storage ready: SQLite (dhcp_monitor.db)
+```
+
+健康检查 `http://127.0.0.1:8888/_health` 应显示：
+
+```text
+DHCP MAC Monitor v1.8.0 OK; storage=SQLite
+```
+
+## 迁移失败怎么办
+
+SQLite 初始化、读取或迁移任何一步失败时，程序会继续使用旧 JSON 模式，并把原因写入 `startup.log`。不要删除旧数据，先保留整个目录进行排查。
+
+## 重要提醒
+
+迁移成功以后，新修改主要写入 `dhcp_monitor.db`，旧 `dhcp_monitor_data.json` 保留的是迁移前状态。因此 V1.8.0 已经运行并产生大量新数据后，不要直接用旧 JSON 覆盖 SQLite 数据库。
+
+正式运行期间不要使用第三方 SQLite 工具直接修改 `dhcp_monitor.db`。
